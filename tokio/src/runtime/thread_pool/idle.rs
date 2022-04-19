@@ -29,11 +29,14 @@ struct State(usize);
 
 impl Idle {
     pub(super) fn new(num_workers: usize) -> Idle {
-        let init = State::new(num_workers);
+        let init = State::new();
+
+        // All workers start as sleepers
+        let sleepers = (0..num_workers).collect();
 
         Idle {
             state: AtomicUsize::new(init.into()),
-            sleepers: Mutex::new(Vec::with_capacity(num_workers)),
+            sleepers: Mutex::new(sleepers),
             num_workers,
         }
     }
@@ -143,10 +146,10 @@ impl Idle {
 }
 
 impl State {
-    fn new(num_workers: usize) -> State {
-        // All workers start in the unparked state
-        let ret = State(num_workers << UNPARK_SHIFT);
-        debug_assert_eq!(num_workers, ret.num_unparked());
+    fn new() -> State {
+        // All workers start in the parked
+        let ret = State(0);
+        debug_assert_eq!(0, ret.num_unparked());
         debug_assert_eq!(0, ret.num_searching());
         ret
     }
@@ -220,7 +223,7 @@ fn test_state() {
     assert_eq!(0, UNPARK_MASK & SEARCH_MASK);
     assert_eq!(0, !(UNPARK_MASK | SEARCH_MASK));
 
-    let state = State::new(10);
-    assert_eq!(10, state.num_unparked());
+    let state = State::new();
+    assert_eq!(0, state.num_unparked());
     assert_eq!(0, state.num_searching());
 }

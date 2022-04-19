@@ -20,6 +20,18 @@ pub(crate) struct Unparker {
     inner: Arc<Inner>,
 }
 
+/// Returned by `unpark()`
+#[derive(Clone, Copy, Debug)]
+#[must_use]
+pub(crate) enum UnparkResult {
+    /// The target thread has been unparked.
+    Unparked,
+
+    /// The target worker does not have an associated thread. The caller must
+    /// spawn a new thread for the worker.
+    Threadless,
+}
+
 struct Inner {
     /// Avoids entering the park if possible
     state: AtomicUsize,
@@ -38,6 +50,7 @@ const EMPTY: usize = 0;
 const PARKED_CONDVAR: usize = 1;
 const PARKED_DRIVER: usize = 2;
 const NOTIFIED: usize = 3;
+const THREADLESS: usize = 4;
 
 /// Shared across multiple Parker handles
 struct Shared {
@@ -54,7 +67,7 @@ impl Parker {
 
         Parker {
             inner: Arc::new(Inner {
-                state: AtomicUsize::new(EMPTY),
+                state: AtomicUsize::new(THREADLESS),
                 mutex: Mutex::new(()),
                 condvar: Condvar::new(),
                 shared: Arc::new(Shared {
@@ -64,13 +77,46 @@ impl Parker {
             }),
         }
     }
+
+    pub(crate) fn unparker(&self) -> Unparker {
+        Unparker {
+            inner: self.inner.clone(),
+        }
+    }
+
+    pub(crate) fn park(&mut self) {
+        self.inner.park();
+    }
+
+    pub(crate) fn park_timeout(&mut self, duration: Duration) {
+        // Only parking with zero is supported...
+        assert_eq!(duration, Duration::from_millis(0));
+
+        if let Some(mut driver) = self.inner.shared.driver.try_lock() {
+            driver.park_timeout(duration).expect("failed to park");
+        }
+    }
+
+    /// Attempt to mark this parker as being threadless. This only succeeds if
+    /// the parker is in the "empty" state, i.e. no pending notifications.
+    pub(crate) fn transition_to_threadless(&self) -> bool {
+        self.inner.transition_to_threadless()
+    }
+
+    pub(crate) fn transition_from_threadless(&self) -> bool {
+        self.inner.transition_from_threadless()
+    }
+
+    pub(crate) fn shutdown(&mut self) {
+        self.inner.shutdown();
+    }
 }
 
 impl Clone for Parker {
     fn clone(&self) -> Parker {
         Parker {
             inner: Arc::new(Inner {
-                state: AtomicUsize::new(EMPTY),
+                state: AtomicUsize::new(THREADLESS),
                 mutex: Mutex::new(()),
                 condvar: Condvar::new(),
                 shared: self.inner.shared.clone(),
@@ -79,44 +125,36 @@ impl Clone for Parker {
     }
 }
 
-impl Park for Parker {
-    type Unpark = Unparker;
-    type Error = ();
-
-    fn unpark(&self) -> Unparker {
-        Unparker {
-            inner: self.inner.clone(),
-        }
-    }
-
-    fn park(&mut self) -> Result<(), Self::Error> {
-        self.inner.park();
-        Ok(())
-    }
-
-    fn park_timeout(&mut self, duration: Duration) -> Result<(), Self::Error> {
-        // Only parking with zero is supported...
-        assert_eq!(duration, Duration::from_millis(0));
-
-        if let Some(mut driver) = self.inner.shared.driver.try_lock() {
-            driver.park_timeout(duration).map_err(|_| ())
-        } else {
-            Ok(())
-        }
-    }
-
-    fn shutdown(&mut self) {
-        self.inner.shutdown();
+impl Unparker {
+    pub(crate) fn unpark(&self) -> UnparkResult {
+        self.inner.unpark()
     }
 }
 
-impl Unpark for Unparker {
-    fn unpark(&self) {
-        self.inner.unpark();
+impl UnparkResult {
+    pub(crate) fn is_threadless(self) -> bool {
+        match self {
+            UnparkResult::Threadless => true,
+            _ => false,
+        }
     }
 }
 
 impl Inner {
+    /// Attempt to transition to threadless. Returns `true` if successful.
+    fn transition_to_threadless(&self) -> bool {
+        self.state
+            .compare_exchange(EMPTY, THREADLESS, SeqCst, SeqCst)
+            .is_ok()
+    }
+
+    /// Attempt to transition from threadless (to assign the worker to a thread). Returns `true` if successful.
+    fn transition_from_threadless(&self) -> bool {
+        self.state
+            .compare_exchange(THREADLESS, EMPTY, SeqCst, SeqCst)
+            .is_ok()
+    }
+
     /// Parks the current thread for at most `dur`.
     fn park(&self) {
         for _ in 0..3 {
@@ -211,17 +249,23 @@ impl Inner {
         }
     }
 
-    fn unpark(&self) {
+    fn unpark(&self) -> UnparkResult {
         // To ensure the unparked thread will observe any writes we made before
         // this call, we must perform a release operation that `park` can
         // synchronize with. To do that we must write `NOTIFIED` even if `state`
         // is already `NOTIFIED`. That is why this must be a swap rather than a
         // compare-and-swap that returns if it reads `NOTIFIED` on failure.
         match self.state.swap(NOTIFIED, SeqCst) {
-            EMPTY => {}    // no one was waiting
-            NOTIFIED => {} // already unparked
-            PARKED_CONDVAR => self.unpark_condvar(),
-            PARKED_DRIVER => self.unpark_driver(),
+            EMPTY | NOTIFIED => UnparkResult::Unparked,
+            PARKED_CONDVAR => {
+                self.unpark_condvar();
+                UnparkResult::Unparked
+            }
+            PARKED_DRIVER => {
+                self.unpark_driver();
+                UnparkResult::Unparked
+            }
+            THREADLESS => UnparkResult::Threadless,
             actual => panic!("inconsistent state in unpark; actual = {}", actual),
         }
     }
