@@ -61,7 +61,7 @@ impl ThreadPool {
     }
 
     pub(crate) fn launch(&mut self) {
-        self.spawner.shared.launch();
+        worker::Shared::launch(&self.spawner.shared);
     }
 
     /// Returns reference to `Spawner`.

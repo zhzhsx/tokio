@@ -103,10 +103,6 @@ impl Parker {
         self.inner.transition_to_threadless()
     }
 
-    pub(crate) fn transition_from_threadless(&self) -> bool {
-        self.inner.transition_from_threadless()
-    }
-
     pub(crate) fn shutdown(&mut self) {
         self.inner.shutdown();
     }
@@ -128,6 +124,10 @@ impl Clone for Parker {
 impl Unparker {
     pub(crate) fn unpark(&self) -> UnparkResult {
         self.inner.unpark()
+    }
+
+    pub(crate) fn transition_from_threadless(&self) -> bool {
+        self.inner.transition_from_threadless()
     }
 }
 

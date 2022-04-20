@@ -254,6 +254,7 @@ pub(super) fn create(
         // makes the rust borrow checker happy. I also probably spent more time
         // writing this comment than working around the borrow checker.
         let mut threadless_workers = shared.threadless_workers.lock();
+        assert!(core.park.is_some());
         threadless_workers.push(Arc::new(Worker {
             shared: shared.clone(),
             index,
@@ -547,7 +548,7 @@ impl ActiveWorker {
         // If there are tasks available to steal, but this worker is not
         // looking for tasks to steal, notify another worker.
         if !core.is_searching && core.run_queue.is_stealable() {
-            self.worker.shared.notify_parked();
+            Shared::notify_parked(&self.worker.shared);
         }
 
         core
@@ -622,7 +623,7 @@ impl Core {
         }
 
         self.is_searching = false;
-        worker.shared.transition_worker_from_searching();
+        Shared::transition_worker_from_searching(&worker.shared);
     }
 
     /// Prepares the worker state for parking.
@@ -647,7 +648,7 @@ impl Core {
         self.is_searching = false;
 
         if is_last_searcher {
-            worker.shared.notify_if_work_pending();
+            Shared::notify_if_work_pending(&worker.shared);
         }
 
         true
@@ -662,7 +663,7 @@ impl Core {
             // state when the wake originates from another worker *or* a new task
             // is pushed. We do *not* want the worker to transition to "searching"
             // when it wakes when the I/O driver receives new events.
-            self.is_searching = !worker.shared.idle.unpark_worker_by_id(worker.index);
+            self.is_searching = !worker.shared.idle.unpark_worker_by_id(worker.index, 0);
             return true;
         }
 
@@ -714,15 +715,18 @@ impl Worker {
         &self.shared.inject
     }
 
-    fn activate_from_threadless(self: Arc<Self>) -> ActiveWorker {
-        let core = self.core.take().expect("core missing");
-        assert!(core
+    fn activate_from_threadless(me: Arc<Self>, is_searching: bool) -> ActiveWorker {
+        let mut core = me.core.take().expect("core missing");
+        core.is_searching = is_searching;
+        /*
+        core
             .park
             .as_ref()
             .expect("park missing")
-            .transition_from_threadless());
+            .transition_from_threadless();
+        */
 
-        ActiveWorker::new(self, core)
+        ActiveWorker::new(me, core)
     }
 }
 
@@ -742,22 +746,21 @@ impl task::Schedule for Arc<Shared> {
 
 impl Shared {
     /// Launch the multi-threaded scheduler
-    pub(crate) fn launch(self: &Arc<Self>) {
+    pub(crate) fn launch(me: &Arc<Self>) {
+        use std::cmp;
+
         // Spawn threads for only *half* the workers. This reserves a few to
         // support `Runtime::block_on` being able to claim a worker.
-        //
-        // Note, if the runtime is initialized with 1 worker, then this will not
-        // spawn any.
-        let num = self.remotes.len() / 2;
+        let num = cmp::max(1, me.remotes.len() / 2);
 
         for _ in 0..num {
             // Because the runtime is in the process of launching, there is no
             // work yet, so it should be impossible for a race condition where
             // some *other* process claims a worker.
-            let worker = self
-                .claim_threadless_worker()
+            let worker = me
+                .claim_threadless_worker(true)
                 .expect("could not claim a worker");
-            self.handle_inner.spawn_blocking(self, move || worker.run());
+            me.handle_inner.spawn_blocking(me, move || worker.run());
         }
     }
 
@@ -771,20 +774,29 @@ impl Shared {
     /// * Remove an entry from `threadless_workers`
     /// * Remove the worker from the idle set
     /// * Update the worker's parker
-    fn claim_threadless_worker(&self) -> Option<ActiveWorker> {
+    fn claim_threadless_worker(&self, is_searching: bool) -> Option<ActiveWorker> {
+        let num_searching = if is_searching { 1 } else { 0 };
         let mut threadless_workers = self.threadless_workers.lock();
 
-        while let Some(worker) = threadless_workers.pop() {
-            // Try to remove the worker from the idle set
-            if !self.idle.unpark_worker_by_id(worker.index) {
-                // The worker is being unparked by another thread
+        for i in 0..threadless_workers.len() {
+            let index = threadless_workers[i].index;
+
+            // First, try to transition from threadless
+            if !self.remotes[index].unpark.transition_from_threadless() {
                 continue;
             }
+
+            // The worker was transitioned from threadless, now we can take it.
+            let worker = threadless_workers.swap_remove(i);
+
+            // Try to remove the worker from the idle set. If it is already
+            // removed concurrently, no big deal.
+            self.idle.unpark_worker_by_id(worker.index, num_searching);
 
             // Release the lock
             drop(threadless_workers);
 
-            return Some(worker.activate_from_threadless());
+            return Some(Worker::activate_from_threadless(worker, is_searching));
         }
 
         None
@@ -796,7 +808,7 @@ impl Shared {
         for (i, worker) in threadless_workers.iter().enumerate() {
             if worker.index == id {
                 let worker = threadless_workers.swap_remove(i);
-                return worker.activate_from_threadless();
+                return Worker::activate_from_threadless(worker, false);
             }
         }
 
@@ -811,33 +823,33 @@ impl Shared {
         let (handle, notified) = me.owned.bind(future, me.clone());
 
         if let Some(notified) = notified {
-            me.schedule(notified, false);
+            Shared::schedule(me, notified, false);
         }
 
         handle
     }
 
-    pub(super) fn schedule(self: &Arc<Self>, task: Notified, is_yield: bool) {
+    pub(super) fn schedule(me: &Arc<Self>, task: Notified, is_yield: bool) {
         CURRENT.with(|maybe_cx| {
             if let Some(cx) = maybe_cx {
                 // Make sure the task is part of the **current** scheduler.
-                if self.ptr_eq(&cx.worker.shared) {
+                if me.ptr_eq(&cx.worker.shared) {
                     // And the current thread still holds a core
                     if let Some(core) = cx.core.borrow_mut().as_mut() {
-                        self.schedule_local(core, task, is_yield);
+                        Shared::schedule_local(me, core, task, is_yield);
                         return;
                     }
                 }
             }
 
             // Otherwise, use the inject queue.
-            self.inject.push(task);
-            self.scheduler_metrics.inc_remote_schedule_count();
-            self.notify_parked();
+            me.inject.push(task);
+            me.scheduler_metrics.inc_remote_schedule_count();
+            Shared::notify_parked(me);
         })
     }
 
-    fn schedule_local(self: &Arc<Self>, core: &mut Core, task: Notified, is_yield: bool) {
+    fn schedule_local(me: &Arc<Self>, core: &mut Core, task: Notified, is_yield: bool) {
         core.metrics.inc_local_schedule_count();
 
         // Spawning from the worker thread. If scheduling a "yield" then the
@@ -846,7 +858,7 @@ impl Shared {
         // flexibility and the task may go to the front of the queue.
         let should_notify = if is_yield {
             core.run_queue
-                .push_back(task, &self.inject, &mut core.metrics);
+                .push_back(task, &me.inject, &mut core.metrics);
             true
         } else {
             // Push to the LIFO slot
@@ -855,7 +867,7 @@ impl Shared {
 
             if let Some(prev) = prev {
                 core.run_queue
-                    .push_back(prev, &self.inject, &mut core.metrics);
+                    .push_back(prev, &me.inject, &mut core.metrics);
             }
 
             core.lifo_slot = Some(task);
@@ -867,12 +879,19 @@ impl Shared {
         // scheduling is from a resource driver. As notifications often come in
         // batches, the notification is delayed until the park is complete.
         if should_notify && core.park.is_some() {
-            self.notify_parked();
+            Shared::notify_parked(me);
         }
     }
 
     pub(super) fn close(&self) {
         if self.inject.close() {
+            // Grab the threadless lock
+            while let Some(active) = self.claim_threadless_worker(false) {
+                let mut core = active.core.borrow_mut().take().unwrap();
+                core.pre_shutdown(&active.worker);
+                self.shutdown(core);
+            }
+
             // Notify all workers so they can shutdown
             for remote in &self.remotes[..] {
                 let _ = remote.unpark.unpark();
@@ -880,34 +899,34 @@ impl Shared {
         }
     }
 
-    fn notify_parked(self: &Arc<Self>) {
-        if let Some(index) = self.idle.worker_to_notify() {
-            if self.remotes[index].unpark.unpark().is_threadless() {
+    fn notify_parked(me: &Arc<Self>) {
+        if let Some(index) = me.idle.worker_to_notify() {
+            if me.remotes[index].unpark.unpark().is_threadless() {
                 // A new thread needs to be spawned for the worker.
-                let active = self.claim_threadless_worker_by_id(index);
-                self.handle_inner.spawn_blocking(self, move || active.run());
+                let active = me.claim_threadless_worker_by_id(index);
+                me.handle_inner.spawn_blocking(me, move || active.run());
             }
         }
     }
 
-    fn notify_if_work_pending(self: &Arc<Self>) {
-        for remote in &self.remotes[..] {
+    fn notify_if_work_pending(me: &Arc<Self>) {
+        for remote in &me.remotes[..] {
             if !remote.steal.is_empty() {
-                self.notify_parked();
+                Shared::notify_parked(me);
                 return;
             }
         }
 
-        if !self.inject.is_empty() {
-            self.notify_parked();
+        if !me.inject.is_empty() {
+            Shared::notify_parked(me);
         }
     }
 
-    fn transition_worker_from_searching(self: &Arc<Self>) {
-        if self.idle.transition_worker_from_searching() {
+    fn transition_worker_from_searching(me: &Arc<Self>) {
+        if me.idle.transition_worker_from_searching() {
             // We are the final searching worker. Because work was found, we
             // need to notify another worker.
-            self.notify_parked();
+            Self::notify_parked(me);
         }
     }
 
@@ -956,6 +975,13 @@ cfg_metrics! {
 
 impl ToHandle for Arc<Shared> {
     fn to_handle(&self) -> crate::runtime::Handle {
-        todo!()
+        use crate::runtime::{self, Handle};
+        use crate::runtime::thread_pool::Spawner;
+
+        Handle {
+            spawner: runtime::Spawner::ThreadPool(Spawner {
+                shared: self.clone(),
+            }),
+        }
     }
 }

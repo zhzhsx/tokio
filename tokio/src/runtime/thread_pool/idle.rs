@@ -116,7 +116,7 @@ impl Idle {
     /// within the worker's park routine.
     ///
     /// Returns `true` if the worker was parked before calling the method.
-    pub(super) fn unpark_worker_by_id(&self, worker_id: usize) -> bool {
+    pub(super) fn unpark_worker_by_id(&self, worker_id: usize, num_searching: usize) -> bool {
         let mut sleepers = self.sleepers.lock();
 
         for index in 0..sleepers.len() {
@@ -124,7 +124,7 @@ impl Idle {
                 sleepers.swap_remove(index);
 
                 // Update the state accordingly while the lock is held.
-                State::unpark_one(&self.state, 0);
+                State::unpark_one(&self.state, num_searching);
 
                 return true;
             }
