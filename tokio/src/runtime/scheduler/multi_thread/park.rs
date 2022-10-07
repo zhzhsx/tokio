@@ -130,7 +130,7 @@ impl Inner {
                 return;
             }
 
-            thread::yield_now();
+            std::thread::yield_now();
         }
 
         if let Some(mut driver) = self.shared.driver.try_lock() {
